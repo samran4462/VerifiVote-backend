@@ -1,4 +1,4 @@
-import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
+import { Injectable, OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { ethers } from 'ethers';
@@ -7,11 +7,14 @@ import { Candidate, CandidateDocument } from '../users/candidate.schema.js';
 import { Election, ElectionDocument } from '../elections/election.schema.js';
 
 @Injectable()
-export class BlockchainIndexerService implements OnModuleInit {
+export class BlockchainIndexerService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(BlockchainIndexerService.name);
   private provider: ethers.JsonRpcProvider;
   private factoryContract: ethers.Contract;
-  
+  private pollInterval: NodeJS.Timeout | null = null;
+  private lastCheckedBlock: number = 0;
+  private isPolling = false;
+
   private readonly FACTORY_ADDRESS = process.env.FACTORY_ADDRESS;
   private readonly FACTORY_ABI = [
     "event ElectionCreated(uint256 indexed electionId, address indexed electionAddress, address creator)"
@@ -28,7 +31,8 @@ export class BlockchainIndexerService implements OnModuleInit {
     @InjectModel(Candidate.name) private candidateModel: Model<CandidateDocument>,
     @InjectModel(Election.name) private electionModel: Model<ElectionDocument>,
   ) {
-    this.provider = new ethers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL || 'https://ethereum-sepolia-public.nodies.app');
+    const rpcUrl = process.env.SEPOLIA_RPC_URL || 'https://ethereum-sepolia-public.nodies.app';
+    this.provider = new ethers.JsonRpcProvider(rpcUrl);
   }
 
   async onModuleInit() {
@@ -36,107 +40,107 @@ export class BlockchainIndexerService implements OnModuleInit {
       this.logger.warn('FACTORY_ADDRESS not set. Blockchain indexer will not start.');
       return;
     }
-    
-    this.factoryContract = new ethers.Contract(this.FACTORY_ADDRESS, this.FACTORY_ABI, this.provider);
-    
-    this.logger.log('Starting Blockchain Indexer & Reconciling past logs...');
-    await this.syncHistoricalLogs();
-    this.setupLiveListeners();
-  }
 
-  async syncHistoricalLogs() {
+    this.factoryContract = new ethers.Contract(this.FACTORY_ADDRESS, this.FACTORY_ABI, this.provider);
+    this.logger.log('Starting Blockchain Polling Indexer (bounded range for public RPC compatibility)...');
+
     try {
       const currentBlock = await this.provider.getBlockNumber();
-      // Look back arbitrarily far for testnet. In production, store lastProcessedBlock in DB.
-      const fromBlock = Math.max(0, currentBlock - 50000); 
+      this.lastCheckedBlock = Math.max(0, currentBlock - 20);
+    } catch (e: any) {
+      this.logger.warn(`Failed to initialize starting block: ${e?.message}`);
+      this.lastCheckedBlock = 0;
+    }
 
-      // 1. Sync Factory Events
-      const creationLogs = await this.factoryContract.queryFilter('ElectionCreated', fromBlock, 'latest');
-      for (const log of creationLogs) {
-        if ('args' in log) {
-           await this.handleElectionCreated(log.args[0], log.args[1], log.args[2]);
-        }
-      }
+    // Run initial poll and then schedule regular polling every 12 seconds
+    this.pollEvents();
+    this.pollInterval = setInterval(() => this.pollEvents(), 12000);
+  }
 
-      // 2. Sync Events for all known active Elections
-      const elections = await this.electionModel.find({ contractAddress: { $exists: true, $ne: null } });
-      for (const el of elections) {
-        const elContract = new ethers.Contract(el.contractAddress, this.ELECTION_ABI, this.provider);
-        
-        const candidateLogs = await elContract.queryFilter('CandidateAdded', fromBlock, 'latest');
-        for (const log of candidateLogs) {
-          if ('args' in log) await this.handleCandidateAdded(log.args[0], log.args[1], el.electionId);
-        }
-        
-        const tokenLogs = await elContract.queryFilter('TokenPurchased', fromBlock, 'latest');
-        for (const log of tokenLogs) {
-          if ('args' in log) await this.handleTokenPurchased(log.args[0]);
-        }
-
-        const voteLogs = await elContract.queryFilter('VoteCast', fromBlock, 'latest');
-        for (const log of voteLogs) {
-          if ('args' in log) await this.handleVoteCast(log.args[0], log.args[1]);
-        }
-
-        const resolveLogs = await elContract.queryFilter('ElectionResolved', fromBlock, 'latest');
-        for (const log of resolveLogs) {
-          if ('args' in log) await this.handleElectionResolved(el.electionId, log.args[0], log.args[1]);
-        }
-      }
-    } catch (error: any) {
-      this.logger.error(`Error during historical sync: ${error.message}`);
+  onModuleDestroy() {
+    if (this.pollInterval) {
+      clearInterval(this.pollInterval);
+      this.pollInterval = null;
     }
   }
 
-  setupLiveListeners() {
-    this.factoryContract.on('ElectionCreated', async (electionId, electionAddress, creator, event) => {
-      this.logger.log(`Live Event: ElectionCreated - ID: ${electionId}`);
-      await this.handleElectionCreated(electionId, electionAddress, creator);
-      this.attachElectionListeners(electionAddress, Number(electionId));
-    });
+  async pollEvents() {
+    if (this.isPolling) return;
+    this.isPolling = true;
 
-    // Attach listeners to already deployed elections
-    this.electionModel.find({ contractAddress: { $exists: true, $ne: null } }).then(elections => {
-      for (const el of elections) {
-        this.attachElectionListeners(el.contractAddress, el.electionId);
+    try {
+      const currentBlock = await this.provider.getBlockNumber();
+      if (currentBlock <= this.lastCheckedBlock) {
+        this.isPolling = false;
+        return;
       }
-    });
-  }
 
-  attachElectionListeners(contractAddress: string, electionId: number) {
-    const contract = new ethers.Contract(contractAddress, this.ELECTION_ABI, this.provider);
-    
-    contract.on('CandidateAdded', async (candidateId, candidateAddress, event) => {
-      this.logger.log(`Live Event: CandidateAdded - ID: ${candidateId}`);
-      await this.handleCandidateAdded(candidateId, candidateAddress, electionId);
-    });
+      // Keep block range strictly within 40 blocks to respect free public RPC limits
+      const fromBlock = Math.max(this.lastCheckedBlock + 1, currentBlock - 40);
+      const toBlock = currentBlock;
 
-    contract.on('TokenPurchased', async (voterAddress, event) => {
-      this.logger.log(`Live Event: TokenPurchased - Voter: ${voterAddress}`);
-      await this.handleTokenPurchased(voterAddress);
-    });
+      // 1. Check Factory Events
+      try {
+        const creationLogs = await this.factoryContract.queryFilter('ElectionCreated', fromBlock, toBlock);
+        for (const log of creationLogs) {
+          if ('args' in log) {
+            await this.handleElectionCreated(log.args[0], log.args[1], log.args[2]);
+          }
+        }
+      } catch (err: any) {
+        // Suppress transient RPC timeouts
+      }
 
-    contract.on('VoteCast', async (voterAddress, candidateId, event) => {
-      this.logger.log(`Live Event: VoteCast - Candidate ID: ${candidateId}`);
-      await this.handleVoteCast(voterAddress, candidateId);
-    });
+      // 2. Check deployed election contracts
+      const elections = await this.electionModel.find({ contractAddress: { $exists: true, $ne: null } });
+      for (const el of elections) {
+        try {
+          const elContract = new ethers.Contract(el.contractAddress, this.ELECTION_ABI, this.provider);
 
-    contract.on('ElectionResolved', async (finalState, winnerId, event) => {
-      this.logger.log(`Live Event: ElectionResolved - Winner: ${winnerId}`);
-      await this.handleElectionResolved(electionId, finalState, winnerId);
-    });
+          const [candidateLogs, tokenLogs, voteLogs, resolveLogs] = await Promise.all([
+            elContract.queryFilter('CandidateAdded', fromBlock, toBlock).catch(() => []),
+            elContract.queryFilter('TokenPurchased', fromBlock, toBlock).catch(() => []),
+            elContract.queryFilter('VoteCast', fromBlock, toBlock).catch(() => []),
+            elContract.queryFilter('ElectionResolved', fromBlock, toBlock).catch(() => []),
+          ]);
+
+          for (const log of candidateLogs) {
+            if ('args' in log) await this.handleCandidateAdded(log.args[0], log.args[1], el.electionId);
+          }
+          for (const log of tokenLogs) {
+            if ('args' in log) await this.handleTokenPurchased(log.args[0]);
+          }
+          for (const log of voteLogs) {
+            if ('args' in log) await this.handleVoteCast(log.args[0], log.args[1]);
+          }
+          for (const log of resolveLogs) {
+            if ('args' in log) await this.handleElectionResolved(el.electionId, log.args[0], log.args[1]);
+          }
+        } catch (contractErr: any) {
+          // Ignore individual contract transient errors
+        }
+      }
+
+      this.lastCheckedBlock = currentBlock;
+    } catch (e: any) {
+      // Catch top-level polling errors silently
+    } finally {
+      this.isPolling = false;
+    }
   }
 
   // --- Handlers ---
   async handleElectionCreated(electionId: bigint, contractAddress: string, creator: string) {
+    this.logger.log(`Indexed Event: ElectionCreated - ID: ${electionId} -> ${contractAddress}`);
     await this.electionModel.findOneAndUpdate(
       { electionId: Number(electionId) },
       { contractAddress },
-      { upsert: true, new: true } // Upsert gracefully if off-chain draft wasn't created first
+      { upsert: true, new: true }
     );
   }
 
   async handleCandidateAdded(candidateId: bigint, candidateAddress: string, electionId: number) {
+    this.logger.log(`Indexed Event: CandidateAdded - ID: ${candidateId} (${candidateAddress})`);
     await this.candidateModel.findOneAndUpdate(
       { walletAddress: candidateAddress.toLowerCase() },
       { candidateId: Number(candidateId), electionId },
@@ -145,6 +149,7 @@ export class BlockchainIndexerService implements OnModuleInit {
   }
 
   async handleTokenPurchased(voterAddress: string) {
+    this.logger.log(`Indexed Event: TokenPurchased - Voter: ${voterAddress}`);
     await this.voterModel.findOneAndUpdate(
       { walletAddress: voterAddress.toLowerCase() },
       { hasToken: true },
@@ -153,14 +158,13 @@ export class BlockchainIndexerService implements OnModuleInit {
   }
 
   async handleVoteCast(voterAddress: string, candidateId: bigint) {
-    // 1. Mark voter
+    this.logger.log(`Indexed Event: VoteCast - Voter: ${voterAddress} for Candidate ID: ${candidateId}`);
     await this.voterModel.findOneAndUpdate(
       { walletAddress: voterAddress.toLowerCase() },
       { hasVoted: true, hasToken: false },
       { new: true }
     );
 
-    // 2. Increment candidate off-chain counter
     await this.candidateModel.findOneAndUpdate(
       { candidateId: Number(candidateId) },
       { $inc: { voteCount: 1 } },
@@ -169,7 +173,7 @@ export class BlockchainIndexerService implements OnModuleInit {
   }
 
   async handleElectionResolved(electionId: number, finalState: bigint, winnerId: bigint) {
-    // Enum mapping: Draft(0), Active(1), Completed(2), Draw(3), Cancelled(4)
+    this.logger.log(`Indexed Event: ElectionResolved - Election: ${electionId}, State: ${finalState}`);
     const stateMap = ['Draft', 'Active', 'Completed', 'Draw', 'Cancelled'];
     const statusStr = stateMap[Number(finalState)] || 'Completed';
 
